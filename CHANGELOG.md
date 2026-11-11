@@ -16,6 +16,100 @@ All notable changes to this project are documented here. The format is based on
   body with a duplicated property is now treated like any other malformed body: SEP-6 falls back to
   `HttpResponseException` and SEP-24 to `HttpRequestException` with the status code.
 
+## [17.0.0] - 2026-10-29
+
+> **Major release; recompile required.** Protocol 30 support: XDR regenerated from stellar-xdr `v30.0` (CAP-84
+> muxed contracts, CAP-87 ML-DSA cost types, CAP-88 millisecond close times), `W...` muxed-contract strkeys and
+> `ScMuxedContractId`, plus a fix for `ScMuxedAccountId`, which encoded and decoded muxed-account `SCAddress`
+> values with the wrong byte order since 14.0.0. Every ledger after the Protocol 30 upgrade fails to decode
+> with the 16.0.0 XDR, so upgrade before your network does. The SEP-45 client now accepts CAP-71
+> `SOROBAN_CREDENTIALS_ADDRESS_V2` challenge entries, which the Java and Python SDKs issue by default on
+> Protocol 27+ networks ([#271](https://github.com/Beans-BV/dotnet-stellar-sdk/pull/271)). The MAUI harness is
+> now also validated on iOS, the iOS Simulator and Mac Catalyst
+> ([#256](https://github.com/Beans-BV/dotnet-stellar-sdk/pull/256)).
+
+### Added
+
+- **Protocol 30 support** ([#269](https://github.com/Beans-BV/dotnet-stellar-sdk/pull/269); implements
+  [#258](https://github.com/Beans-BV/dotnet-stellar-sdk/issues/258) and
+  [#266](https://github.com/Beans-BV/dotnet-stellar-sdk/issues/266)):
+  - XDR regenerated from stellar-xdr `v30.0` (`4f524bb`): CAP-88 `STELLAR_VALUE_SIGNED_MS` and
+    `STELLAR_VALUE_EMPTY_TX_SET_MS` (each with a `TimePointMs closeTimeMs`), CAP-84
+    `SC_ADDRESS_TYPE_MUXED_CONTRACT` (`MuxedContract`), CAP-87 `ContractCostType` values 86 to 94 (ML-DSA), and
+    the schema bound on contract spec type and event names widened to `SC_SPEC_TYPE_NAME_LIMIT` (1024). The
+    generated code does not enforce inline `string<N>` bounds
+    ([#250](https://github.com/Beans-BV/dotnet-stellar-sdk/issues/250)), so for type names the wider bound
+    changes only the schema, not what encodes or decodes (for `SCSpecEventV0.Name`, see **Changed**). Every
+    ledger after the Protocol 30 upgrade uses one of the new `StellarValue` arms, so decoding a `LedgerHeader`
+    or `LedgerCloseMeta` (the `headerXdr` and `metadataXdr` that Stellar RPC returns, Horizon's `header_xdr`)
+    failed with the 16.0.0 XDR. Only the `TEST_FEATURE` block is still stripped from the schemas.
+  - `W...` strkeys for muxed contracts (SEP-23): `StrKey.VersionByte.MUXED_CONTRACT`,
+    `StrKey.EncodeMuxedContractId`, `DecodeMuxedContractId` and `IsValidMuxedContractId`. The payload is the
+    32-byte contract ID followed by the 8-byte big-endian muxed ID. Unlike the other byte-array `StrKey.Encode*`
+    methods, `EncodeMuxedContractId` checks the payload length and throws `ArgumentException` for anything but
+    40 bytes, so it cannot produce a `W...` strkey that `DecodeMuxedContractId` rejects.
+  - `ScMuxedContractId`, the `ScAddress` for `SC_ADDRESS_TYPE_MUXED_CONTRACT`, built from a `W...` strkey or
+    from a contract ID and a muxed ID, with `ContractId` and `Id` accessors. Contract values, events and
+    authorization entries holding a muxed contract previously threw `InvalidDataException` on decode.
+    `ScContractId` and `ScMuxedAccountId` reject `W...` strkeys.
+  - `ContractCreditedEffectResponse.ContractMuxed` and `ContractMuxedId`, which Horizon sets when a SAC
+    `transfer` or `mint` goes to a muxed contract.
+  - Encodings are verified byte-for-byte against go-stellar-sdk v0.8.0 via the known-answer vectors in
+    `StellarDotnetSdk.Tests/TestData/generate-p30-kat.go`, and the strkeys against the SEP-23 test vectors.
+
+### Changed
+
+- **Breaking:** `StellarDotnetSdk.Xdr.SCSpecEventV0.Name` is now a `string` instead of an `SCSymbol`,
+  following stellar-xdr#312, which widened contract event names to `string<1024>`. Code that reads or sets it
+  needs a recompile and, where it used `SCSymbol`, a source change. As an inline string it no longer enforces
+  the 32-byte `SCSymbol` limit (nor the new 1024-byte one, see
+  [#250](https://github.com/Beans-BV/dotnet-stellar-sdk/issues/250)), and like the other inline strings it
+  decodes non-UTF-8 bytes to U+FFFD, so such a name no longer re-encodes to its original bytes
+  ([#247](https://github.com/Beans-BV/dotnet-stellar-sdk/issues/247)).
+- **Breaking (behavioral):** Protocol 30 XDR and strkeys. `SCAddressType`, `StellarValueType` and
+  `ContractCostType` gain members (`SC_ADDRESS_TYPE_MUXED_CONTRACT`, `STELLAR_VALUE_SIGNED_MS`,
+  `STELLAR_VALUE_EMPTY_TX_SET_MS`, `MlDsa44DecodeVerifyingKey` to `VerifyMlDsa87Sig`) and `StrKey.VersionByte`
+  gains `MUXED_CONTRACT`, so values that used to fail to decode with `InvalidDataException` now decode, and
+  code that switches over these enums or over `ScAddress` subclasses meets cases it has not seen
+  (`ScMuxedContractId`). `StrKey.DecodeVersionByte` returns `MUXED_CONTRACT` for a `W...` strkey instead of
+  throwing `FormatException`, so `ServerWebAuth.BuildChallengeTransaction` now rejects a `W...`
+  `clientAccountId` with `InvalidWebAuthenticationException`, as it already did for `C...` and `M...`.
+
+### Fixed
+
+- `ScMuxedAccountId` encoded and decoded `SC_ADDRESS_TYPE_MUXED_ACCOUNT` with the strkey payload (key, then ID)
+  copied straight into the XDR struct (ID, then key). `ToXdr()` produced an unrelated account and ID, so a
+  contract call that passed `new ScMuxedAccountId("M...")` (for example as a SAC `transfer` destination)
+  addressed the wrong account, and `FromXdr` returned the wrong `M...` strkey for muxed addresses read from
+  events or return values. Round-tripping through the SDK hid the bug. `SCAddress` XDR built by `ToXdr()`
+  and `M...` strkeys returned by `FromXdr` in 14.0.0 through 16.0.0 differ from what this release produces for
+  the same address, so re-derive any you stored; `M...` strkeys that did not come from `FromXdr` were always
+  right ([#267](https://github.com/Beans-BV/dotnet-stellar-sdk/pull/267)).
+- The `[Obsolete]` messages on `StrKey.EncodeStellarMuxedAccount` and `StrKey.DecodeStellarMuxedAccount`
+  pointed to `EncodeMed25519PublicKey`, which is not a drop-in replacement (it takes the SEP-23 payload, key then
+  ID, not XDR), and to `DecodeMuxedEd25519PublicKey`, which does not exist. They now point to
+  `MuxedAccount.FromXdrMuxedAccount`, `MuxedAccountMed25519.FromMuxedAccountId` and `KeyPair.FromAccountId`, and
+  the `EncodeMed25519PublicKey` / `DecodeMed25519PublicKey` docs describe the payload layout.
+- `MuxedAccountMed25519.FromMuxedAccountId` threw `NullReferenceException` for a `G...` address and
+  `FormatException` or `IndexOutOfRangeException` for other non-`M...` input. It now throws
+  `ArgumentException`. It and `MuxedAccountMed25519.Address` no longer call the obsolete `StrKey` muxed-account
+  methods.
+- `StrKey` decoding threw `IndexOutOfRangeException` for a strkey whose last character is not ASCII. It now
+  throws `ArgumentException`, like any other invalid character.
+- The SEP-45 client (`ClientWebAuthContract`) now accepts challenges whose authorization entries carry Protocol
+  27 `SOROBAN_CREDENTIALS_ADDRESS_V2` credentials (CAP-0071-02), alongside the legacy
+  `SOROBAN_CREDENTIALS_ADDRESS` ([#271](https://github.com/Beans-BV/dotnet-stellar-sdk/pull/271); fixes
+  [#240](https://github.com/Beans-BV/dotnet-stellar-sdk/issues/240)). Challenge validation, server-signature
+  verification and client signing all rejected the V2 arm, so the client could not authenticate against an
+  anchor built on the Java SDK 5.0.0 or the Python SDK 16.0.0, both of which issue V2 challenge entries by
+  default on protocol 27+ networks. A V2 entry is verified and signed over the address-bound
+  `ENVELOPE_TYPE_SOROBAN_AUTHORIZATION_WITH_ADDRESS` preimage, bound to that entry's own credential address, and
+  a V1 entry still uses the legacy `ENVELOPE_TYPE_SOROBAN_AUTHORIZATION` preimage. Challenges that mix the two
+  arms are accepted, and signing never changes an entry's arm. A `ClientDomainEntrySigningDelegate` that returns
+  the client-domain entry under a different arm is now rejected with `InvalidArgumentsException`. Source-account
+  and `SOROBAN_CREDENTIALS_ADDRESS_WITH_DELEGATES` credentials are still rejected, because SEP-45 defines
+  challenge entries by their `credentials.address` only.
+
 ## [16.0.0] - 2026-10-03
 
 > **Major release; recompile required.** Protocol 27 (CAP-71) Soroban authorization, now defaulting to
@@ -1073,5 +1167,6 @@ All notable changes to this project are documented here. The format is based on
   mark; it was rejected as invalid JSON. It reads response bodies through the size-bounded reader the SEP-12
   `KycService` uses, so a fix to that reader reaches both clients.
 
-[Unreleased]: https://github.com/Beans-BV/dotnet-stellar-sdk/compare/16.0.0...HEAD
+[Unreleased]: https://github.com/Beans-BV/dotnet-stellar-sdk/compare/17.0.0...HEAD
+[17.0.0]: https://github.com/Beans-BV/dotnet-stellar-sdk/compare/16.0.0...17.0.0
 [16.0.0]: https://github.com/Beans-BV/dotnet-stellar-sdk/compare/15.1.0...16.0.0

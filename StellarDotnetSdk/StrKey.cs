@@ -1,6 +1,8 @@
 ﻿using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
+using StellarDotnetSdk.Compatibility;
 using FormatException = StellarDotnetSdk.Exceptions.FormatException;
 using xdrSDK = StellarDotnetSdk.Xdr;
 
@@ -11,7 +13,8 @@ using MuxedAccount = xdrSDK.MuxedAccount;
 /// <summary>
 ///     Provides methods for encoding and decoding Stellar keys using StrKey format (RFC 4648 base32 with a
 ///     version byte prefix and CRC16-XModem checksum). This format is used for all human-readable Stellar
-///     identifiers including account IDs (G...), secret seeds (S...), contract IDs (C...), and muxed accounts (M...).
+///     identifiers including account IDs (G...), secret seeds (S...), contract IDs (C...), muxed accounts (M...)
+///     and muxed contracts (W...).
 /// </summary>
 public static class StrKey
 {
@@ -48,6 +51,9 @@ public static class StrKey
 
         /// <summary>Claimable balance ID (encoded with 'B' prefix).</summary>
         CLAIMABLE_BALANCE = 1 << 3,
+
+        /// <summary>Muxed contract address, CAP-84 (encoded with 'W' prefix).</summary>
+        MUXED_CONTRACT = 22 << 3,
     }
 
     private static readonly byte[] Base32LookupTable = DecodingTable();
@@ -76,7 +82,13 @@ public static class StrKey
     /// <summary>
     ///     Encodes raw bytes to a Muxed_Ed25519 public key.
     /// </summary>
-    /// <param name="data">A raw byte array.</param>
+    /// <remarks>
+    ///     The payload is the SEP-23 layout: the 32-byte Ed25519 public key followed by the 8-byte big-endian muxed
+    ///     ID. This is not the XDR encoding of <c>MuxedEd25519Account</c> or <c>MuxedAccount.MuxedAccountMed25519</c>,
+    ///     which put the ID first. To encode an account and ID, use
+    ///     <see cref="Accounts.MuxedAccountMed25519.Address" /> instead.
+    /// </remarks>
+    /// <param name="data">The 40-byte payload: the Ed25519 public key, then the big-endian muxed ID.</param>
     /// <returns>Base32-encoded representation (M...) of the provided data.</returns>
     public static string EncodeMed25519PublicKey(byte[] data)
     {
@@ -181,11 +193,70 @@ public static class StrKey
     }
 
     /// <summary>
+    ///     Encodes raw bytes to a muxed contract address (CAP-84).
+    /// </summary>
+    /// <param name="data">The 32-byte contract ID followed by the 8-byte big-endian muxed ID.</param>
+    /// <returns>Base32-encoded representation (W...) of the provided data.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="data" /> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="data" /> is not 40 bytes long.</exception>
+    public static string EncodeMuxedContractId(byte[] data)
+    {
+        Throw.IfNull(data, nameof(data));
+        if (data.Length != 40)
+        {
+            throw new ArgumentException("Muxed contract bytes must be 40 bytes long, got " + data.Length,
+                nameof(data));
+        }
+
+        return EncodeCheck(VersionByte.MUXED_CONTRACT, data);
+    }
+
+    /// <summary>
+    ///     Builds the raw payload of a muxed contract address (W...): the 32-byte contract ID followed by the
+    ///     8-byte big-endian muxed ID (SEP-23). The XDR <c>MuxedContract</c> struct carries the ID first, so its
+    ///     encoding is not this payload.
+    /// </summary>
+    /// <param name="contractId">The 32-byte contract ID.</param>
+    /// <param name="id">The muxed ID.</param>
+    /// <returns>The 40-byte payload to pass to <see cref="EncodeMuxedContractId" />.</returns>
+    internal static byte[] ToRawMuxedContractId(byte[] contractId, ulong id)
+    {
+        if (contractId.Length != 32)
+        {
+            throw new ArgumentException(
+                "Muxed contract ID must be 32 bytes long, got " + contractId.Length, nameof(contractId));
+        }
+
+        var raw = new byte[40];
+        contractId.CopyTo(raw, 0);
+        BinaryPrimitives.WriteUInt64BigEndian(raw.AsSpan(32), id);
+        return raw;
+    }
+
+    /// <summary>
+    ///     Splits the raw payload of a muxed contract address (W...) into its 32-byte contract ID and its muxed ID.
+    /// </summary>
+    /// <param name="raw">The 40-byte payload returned by <see cref="DecodeMuxedContractId" />.</param>
+    /// <returns>The contract ID and the muxed ID.</returns>
+    internal static (byte[] ContractId, ulong Id) FromRawMuxedContractId(byte[] raw)
+    {
+        if (raw.Length != 40)
+        {
+            throw new ArgumentException("Muxed contract bytes must be 40 bytes long, got " + raw.Length,
+                nameof(raw));
+        }
+
+        return (raw[..32], BinaryPrimitives.ReadUInt64BigEndian(raw.AsSpan(32)));
+    }
+
+    /// <summary>
     ///     Encodes an XDR muxed account to its StrKey string representation.
     /// </summary>
     /// <param name="muxedAccount">The XDR muxed account to encode.</param>
     /// <returns>A StrKey-encoded string (G... for Ed25519, M... for muxed Ed25519).</returns>
-    [Obsolete("Deprecated. Use EncodeMed25519PublicKey instead.")]
+    [Obsolete("Deprecated. Use Accounts.MuxedAccount.FromXdrMuxedAccount(muxedAccount).Address instead, which "
+              + "returns a MuxedAccountMed25519 for M... addresses. EncodeMed25519PublicKey is not a drop-in "
+              + "replacement: it takes the SEP-23 payload, not XDR.")]
     public static string EncodeStellarMuxedAccount(MuxedAccount muxedAccount)
     {
         switch (muxedAccount.Discriminant.InnerValue)
@@ -218,8 +289,14 @@ public static class StrKey
     /// <summary>
     ///     Attempts to decode a muxed Ed25519 public key (M...) to raw bytes.
     /// </summary>
+    /// <remarks>
+    ///     The decoded bytes use the layout described on <see cref="DecodeMed25519PublicKey" />.
+    /// </remarks>
     /// <param name="publicKey">The StrKey-encoded muxed public key.</param>
-    /// <param name="decoded">When this method returns, contains the decoded bytes if successful.</param>
+    /// <param name="decoded">
+    ///     When this method returns, contains the 40-byte payload (the Ed25519 public key, then the big-endian muxed
+    ///     ID) if successful.
+    /// </param>
     /// <returns><c>true</c> if the decoding succeeded; otherwise, <c>false</c>.</returns>
     public static bool TryDecodeMed25519PublicKey(string publicKey, out byte[] decoded)
     {
@@ -266,8 +343,14 @@ public static class StrKey
     /// <summary>
     ///     Decodes a Stellar Muxed_Ed25519 public key to raw bytes.
     /// </summary>
+    /// <remarks>
+    ///     The result is the SEP-23 payload: the 32-byte Ed25519 public key followed by the 8-byte big-endian muxed
+    ///     ID. This is not the XDR encoding of <c>MuxedEd25519Account</c> or <c>MuxedAccount.MuxedAccountMed25519</c>,
+    ///     which put the ID first, so do not pass it to their <c>Decode</c> methods. To get the account and ID, use
+    ///     <see cref="Accounts.MuxedAccountMed25519.FromMuxedAccountId" /> instead.
+    /// </remarks>
     /// <param name="publicKey">A base32-encoded Muxed_Ed25519 public key (M...).</param>
-    /// <returns>Raw bytes of the provided Muxed_Ed25519 public key.</returns>
+    /// <returns>The 40-byte payload: the Ed25519 public key, then the big-endian muxed ID.</returns>
     public static byte[] DecodeMed25519PublicKey(string publicKey)
     {
         return DecodeCheck(VersionByte.MUXED_ED25519, publicKey);
@@ -367,12 +450,23 @@ public static class StrKey
     }
 
     /// <summary>
+    ///     Decodes a muxed contract address (CAP-84) to raw bytes.
+    /// </summary>
+    /// <param name="data">A base32-encoded muxed contract address (W...).</param>
+    /// <returns>The 32-byte contract ID followed by the 8-byte big-endian muxed ID.</returns>
+    public static byte[] DecodeMuxedContractId(string data)
+    {
+        return DecodeCheck(VersionByte.MUXED_CONTRACT, data);
+    }
+
+    /// <summary>
     ///     Decodes a StrKey-encoded string to an XDR <see cref="MuxedAccount" />.
     ///     Supports both Ed25519 (G...) and muxed Ed25519 (M...) addresses.
     /// </summary>
     /// <param name="data">A StrKey-encoded account address.</param>
     /// <returns>The decoded XDR <see cref="MuxedAccount" />.</returns>
-    [Obsolete("Deprecated. Use DecodeMuxedEd25519PublicKey instead.")]
+    [Obsolete("Deprecated. Use MuxedAccountMed25519.FromMuxedAccountId(address).MuxedAccount for M... addresses, "
+              + "or KeyPair.FromAccountId(address).MuxedAccount for G... addresses, instead.")]
     public static MuxedAccount DecodeStellarMuxedAccount(string data)
     {
         var muxed = new MuxedAccount();
@@ -483,6 +577,16 @@ public static class StrKey
     }
 
     /// <summary>
+    ///     Checks validity of a muxed contract address (CAP-84).
+    /// </summary>
+    /// <param name="muxedContractId">The muxed contract address (W...) to check.</param>
+    /// <returns>True if the given muxed contract address is valid, false otherwise.</returns>
+    public static bool IsValidMuxedContractId(string muxedContractId)
+    {
+        return IsValid(VersionByte.MUXED_CONTRACT, muxedContractId);
+    }
+
+    /// <summary>
     ///     Checks validity of a muxed account address (M...).
     /// </summary>
     /// <param name="publicKey">The muxed account address to check.</param>
@@ -537,6 +641,11 @@ public static class StrKey
             case > 0:
             {
                 var lastChar = encoded[^1];
+                if (lastChar >= Base32LookupTable.Length)
+                {
+                    throw new ArgumentException("Character is not a Base32 character.");
+                }
+
                 var decodedLastChar = Base32LookupTable[lastChar];
 
                 var leftoverBitsMask = (byte)(0x0f >> (4 - leftoverBits));
@@ -592,6 +701,7 @@ public static class StrKey
                 }
                 break;
             case VersionByte.MUXED_ED25519:
+            case VersionByte.MUXED_CONTRACT:
                 if (data.Length != 32 + 8)
                 {
                     throw new ArgumentException(
